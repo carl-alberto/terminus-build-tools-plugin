@@ -232,9 +232,14 @@ class ProjectCreateCommand extends BuildToolsBase
             $target_label = "$github_org/$target";
         }
 
+        // Pull down the source project
+        $tmpsitedir = $this->tempdir('local-site');
+        $this->log()->notice('Create a local working copy of {src}', ['src' => $source]);
+        $siteDir = $this->createFromSourceProject($source, $target, $tmpsitedir, $stability = '');
+
         // Create the github repository
-        $this->log()->notice('Create GitHub project {target} from {src}', ['src' => $source, 'target' => $target_label]);
-        list($target_project, $siteDir) = $this->createGitHub($source, $target, $github_org, $github_token, $stability);
+        $this->log()->notice('Create GitHub project {target}', ['target' => $target_label]);
+        $target_project = $this->createGitHub($target, $siteDir, $github_org, $github_token);
 
         $site = null;
         try {

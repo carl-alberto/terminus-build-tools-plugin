@@ -347,9 +347,28 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
     }
 
     /**
-     * Use the GitHub API to create a new GitHub project.
+     * Use composer create-project to create a new local copy of the source project.
      */
-    protected function createGitHub($source, $target, $github_org, $github_token, $stability = '')
+    protected function createFromSourceProject($source, $target, $tmpsitedir, $stability = '')
+    {
+        $source_project = $this->sourceProjectFromSource($source);
+
+        $this->log()->notice('Creating project and resolving dependencies.');
+
+        // If the source is 'org/project:dev-branch', then automatically
+        // set the stability to 'dev'.
+        if (empty($stability) && preg_match('#:dev-#', $source)) {
+            $stability = 'dev';
+        }
+        // Pass in --stability to `composer create-project` if user requested it.
+        $stability_flag = empty($stability) ? '' : "--stability $stability";
+
+        $this->passthru("composer create-project --working-dir=$tmpsitedir $source $target -n $stability_flag");
+        $local_site_path = "$tmpsitedir/$target";
+        return $local_site_path;
+    }
+
+    protected function createGitHub($target, $local_site_path, $github_org, $github_token)
     {
         // We need a different URL here if $github_org is an org; if no
         // org is provided, then we use a simpler URL to create a repository
@@ -363,23 +382,8 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
         }
         $target_project = "$target_org/$target";
 
-        $source_project = $this->sourceProjectFromSource($source);
-        $tmpsitedir = $this->tempdir('local-site');
-
-        $this->log()->notice('Creating project and resolving dependencies.');
-
-        // If the source is 'org/project:dev-branch', then automatically
-        // set the stability to 'dev'.
-        if (empty($stability) && preg_match('#:dev-#', $source)) {
-            $stability = 'dev';
-        }
-        // Pass in --stability to `composer create-project` if user requested it.
-        $stability_flag = empty($stability) ? '' : "--stability $stability";
-
-        $this->passthru("composer create-project --working-dir=$tmpsitedir $source $target -n $stability_flag");
-
         // Create a GitHub repository
-        $this->log()->notice('Creating repository {repo} from {source}', ['repo' => $target_project, 'source' => $source]);
+        $this->log()->notice('Creating repository {repo}', ['repo' => $target_project]);
         $postData = ['name' => $target];
         $result = $this->curlGitHub($createRepoUrl, $postData, $github_token);
 
@@ -387,11 +391,10 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
         // when collecting the build metadata later. We use the 'pantheon'
         // remote when pushing.
         // TODO: Do we need to remove $local_site_path/.git? (-n in create-project should obviate this need)
-        $local_site_path = "$tmpsitedir/$target";
         $this->passthru("git -C $local_site_path init");
         $this->passthru("git -C $local_site_path remote add origin 'git@github.com:{$target_project}.git'");
 
-        return [$target_project, $local_site_path];
+        return $target_project;
     }
 
     /**
