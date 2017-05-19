@@ -235,7 +235,7 @@ class ProjectCreateCommand extends BuildToolsBase
         // Pull down the source project
         $tmpsitedir = $this->tempdir('local-site');
         $this->log()->notice('Create a local working copy of {src}', ['src' => $source]);
-        $siteDir = $this->createFromSourceProject($source, $target, $tmpsitedir, $stability = '');
+        $siteDir = $this->createFromSourceProject($source, $target, $tmpsitedir, $stability);
 
         // Create the github repository
         $this->log()->notice('Create GitHub project {target}', ['target' => $target_label]);
@@ -285,7 +285,7 @@ class ProjectCreateCommand extends BuildToolsBase
 
             $this->log()->notice('Install the site on the dev environment');
 
-            $circle_env = $this->getCIEnvironment($site_name, $options);
+            $circle_env = $this->getCIEnvironment($site_name, $options, $github_token);
             $composer_json = $this->getComposerJson($siteDir);
 
             // Install the site.

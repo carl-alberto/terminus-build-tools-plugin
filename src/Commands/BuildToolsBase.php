@@ -154,7 +154,7 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
      * @param array $options
      * @return array
      */
-    public function getCIEnvironment($site_name, $options)
+    public function getCIEnvironment($site_name, $options, $github_token = NULL)
     {
         $site = $this->getSite($site_name);
 
@@ -199,7 +199,9 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
         }
 
         // Add the github token if available
-        $github_token = getenv('GITHUB_TOKEN');
+        if (!$github_token) {
+            $github_token = getenv('GITHUB_TOKEN');
+        }
         if ($github_token) {
             $circle_env['GITHUB_TOKEN'] = $github_token;
         }
