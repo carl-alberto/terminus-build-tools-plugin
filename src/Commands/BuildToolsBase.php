@@ -2,7 +2,7 @@
 /**
  * Terminus Plugin that contain a collection of commands useful during
  * the build step on a [Pantheon](https://www.pantheon.io) site that uses
- * a GitHub PR workflow.
+ * a Git PR workflow.
  *
  * See README.md for usage information.
  */
@@ -23,12 +23,22 @@ use Consolidation\AnnotatedCommand\CommandData;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Output\OutputInterface;
 use Composer\Semver\Comparator;
+use Pantheon\TerminusBuildTools\ServiceProviders\CIProviders\CIState;
+use Pantheon\TerminusBuildTools\ServiceProviders\ProviderEnvironment;
+use Pantheon\TerminusBuildTools\ServiceProviders\SiteProviders\SiteEnvironment;
+use Pantheon\Terminus\DataStore\FileStore;
+use Pantheon\TerminusBuildTools\Credentials\CredentialManager;
+use Pantheon\TerminusBuildTools\ServiceProviders\ProviderManager;
+
+use Robo\Contract\BuilderAwareInterface;
+use Robo\LoadAllTasks;
 
 /**
  * Build Tool Base Command
  */
-class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
+class BuildToolsBase extends TerminusCommand implements SiteAwareInterface, BuilderAwareInterface
 {
+    use LoadAllTasks; // uses TaskAccessor, which uses BuilderAwareTrait
     use SiteAwareTrait;
 
     const TRANSIENT_CI_DELETE_PATTERN = '^ci-';
@@ -37,12 +47,74 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
 
     protected $tmpDirs = [];
 
+    protected $provider_manager;
+    protected $ci_provider;
+    protected $git_provider;
+
     /**
-     * Object constructor
+     * Constructor
+     *
+     * @param ProviderManager $provider_manager Provider manager may be injected for testing (not used). It is
+     * not passed in by Terminus.
      */
-    public function __construct()
+    public function __construct($provider_manager = null)
     {
-        parent::__construct();
+        $this->provider_manager = $provider_manager;
+    }
+
+    public function providerManager()
+    {
+        if (!$this->provider_manager) {
+            // TODO: how can we do DI from within a Terminus Plugin? Huh?
+            // Delayed initialization is one option.
+            $credential_store = new FileStore($this->getConfig()->get('cache_dir') . '/build-tools');
+            $credentialManager = new CredentialManager($credential_store);
+            $credentialManager->setUserId($this->loggedInUserEmail());
+            $this->provider_manager = new ProviderManager($credentialManager);
+            $this->provider_manager->setLogger($this->logger);
+        }
+        return $this->provider_manager;
+    }
+
+    protected function createGitProvider($git_provider_class_or_alias)
+    {
+        $this->git_provider = $this->providerManager()->createProvider($git_provider_class_or_alias, \Pantheon\TerminusBuildTools\ServiceProviders\RepositoryProviders\GitProvider::class);
+    }
+
+    protected function createCIProvider($ci_provider_class_or_alias)
+    {
+        $this->ci_provider = $this->providerManager()->createProvider($ci_provider_class_or_alias, \Pantheon\TerminusBuildTools\ServiceProviders\CIProviders\CIProvider::class);
+    }
+
+    protected function createProviders($git_provider_class_or_alias, $ci_provider_class_or_alias)
+    {
+        if (isset($ci_provider_class_or_alias)) {
+            $this->createCIProvider($ci_provider_class_or_alias);
+        }
+        if (isset($git_provider_class_or_alias)) {
+            $this->createGitProvider($git_provider_class_or_alias);
+        }
+    }
+
+    protected function getUrlFromBuildMetadata($site_name_and_env)
+    {
+        // Get the build metadata from the Pantheon site. Fail if there is
+        // no build metadata on the master branch of the Pantheon site.
+        $buildMetadata = $this->retrieveBuildMetadata($site_name_and_env) + ['url' => ''];
+        if (empty($buildMetadata['url'])) {
+            throw new TerminusException('The site {site} was not created with the build-env:create-project command; it therefore cannot be used with this command.', ['site' => $site_name]);
+        }
+        return $buildMetadata['url'];
+    }
+
+    protected function inferGitProviderFromUrl($url)
+    {
+        $provider = $this->providerManager()->inferProvider($url, \Pantheon\TerminusBuildTools\ServiceProviders\RepositoryProviders\GitProvider::class);
+        if (!$provider) {
+             throw new TerminusException('Could not figure out which git repository service to use with {url}.', ['url' => $url]);
+        }
+        $this->git_provider = $provider;
+        return $provider;
     }
 
     /**
@@ -58,9 +130,9 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
     }
 
     /**
-     * Recover the session's machine token.
+     * Get the email address of the user that is logged-in to Pantheon
      */
-    protected function recoverSessionMachineToken()
+    protected function loggedInUserEmail()
     {
         if (!$this->session()->isActive()) {
             $this->log()->notice('No active session.');
@@ -74,7 +146,18 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
         }
 
         // Look up the email address of the active user (as auth:whoami does).
-        $email_address = $user_data['email'];
+        return $user_data['email'];
+    }
+
+    /**
+     * Recover the Pantheon session's machine token.
+     */
+    protected function recoverSessionMachineToken()
+    {
+        $email_address = $this->loggedInUserEmail();
+        if (!$email_address) {
+            return;
+        }
 
         // Try to look up the machine token using the Terminus API.
         $tokens = $this->session()->getTokens();
@@ -95,7 +178,7 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
     }
 
     /**
-     * Return the list of available organizations
+     * Return the list of available Pantheon organizations
      */
     protected function availableOrgs()
     {
@@ -135,29 +218,14 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
     }
 
     /**
-     * Determine whether or not this site can create multidev environments.
-     */
-    protected function siteHasMultidevCapability($site)
-    {
-        // Can our new site create multidevs?
-        $settings = $site->get('settings');
-        if (!$settings) {
-            return false;
-        }
-        return $settings->max_num_cdes > 0;
-    }
-
-    /**
      * Return the set of environment variables to save on the CI server.
      *
      * @param string $site_name
      * @param array $options
-     * @return array
+     * @return CIState
      */
     public function getCIEnvironment($site_name, $options)
     {
-        $site = $this->getSite($site_name);
-
         $options += [
             'test-site-name' => '',
             'email' => '',
@@ -183,37 +251,30 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
             throw new TerminusException("Please generate a Pantheon machine token, as described in https://pantheon.io/docs/machine-tokens/. Then log in via: \n\nterminus auth:login --machine-token=my_machine_token_value");
         }
 
-        // Set up Circle CI and run our first test.
-        $circle_env = [
-            'TERMINUS_TOKEN' => $terminus_token,
-            'TERMINUS_SITE' => $site_name,
-            'TEST_SITE_NAME' => $test_site_name,
-            'ADMIN_PASSWORD' => $admin_password,
-            'ADMIN_EMAIL' => $admin_email,
-            'GIT_EMAIL' => $git_email,
-        ];
-        // If this site cannot create multidev environments, then configure
-        // it to always run tests on the dev environment.
-        if (!$this->siteHasMultidevCapability($site)) {
-            $circle_env['TERMINUS_ENV'] = 'dev';
-        }
+        $ci_env = new CIState();
 
-        // Add the github token if available
-        $github_token = getenv('GITHUB_TOKEN');
-        if ($github_token) {
-            $circle_env['GITHUB_TOKEN'] = $github_token;
-        }
+        $siteAttributes = (new SiteEnvironment())
+            ->setSiteName($site_name)
+            ->setSiteToken($terminus_token)
+            ->setTestSiteName($test_site_name)
+            ->setAdminPassword($admin_password)
+            ->setAdminEmail($admin_email)
+            ->setGitEmail($git_email);
+
+        $ci_env->storeState('site', $siteAttributes);
 
         // Add in extra environment provided on command line via
         // --env='key=value' --env='another=v2'
+        $envState = new ProviderEnvironment();
         foreach ($extra_env as $env) {
             list($key, $value) = explode('=', $env, 2) + ['',''];
             if (!empty($key) && !empty($value)) {
-                $circle_env[$key] = $value;
+                $envState[$key] = $value;
             }
         }
+        $ci_env->storeState('env', $envState);
 
-        return $circle_env;
+        return $ci_env;
     }
 
     /**
@@ -255,37 +316,6 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
     }
 
     /**
-     * Write the CI environment variables to the Circle "envrionment variables" configuration section.
-     *
-     * @param string $target_project
-     * @param string $circle_token
-     * @param array $circle_env
-     */
-    public function configureCircle($target_project, $circle_token, $circle_env)
-    {
-        $this->log()->notice('Configure Circle CI');
-
-        $site_name = $circle_env['TERMINUS_SITE'];
-        $git_email = $circle_env['GIT_EMAIL'];
-        $target_label = strtr($target_project, '/', '-');
-
-        $circle_url = "https://circleci.com/api/v1.1/project/github/$target_project";
-        $this->setCircleEnvironmentVars($circle_url, $circle_token, $circle_env);
-
-        // Create an ssh key pair dedicated to use in these tests.
-        // Change the email address to "user+ci-SITE@domain.com" so
-        // that these keys can be differentiated in the Pantheon dashboard.
-        $ssh_key_email = str_replace('@', "+ci-{$target_label}@", $git_email);
-        $this->log()->notice('Create ssh key pair for {email}', ['email' => $ssh_key_email]);
-        list($publicKey, $privateKey) = $this->createSshKeyPair($ssh_key_email, $site_name . '-key');
-        $this->addPublicKeyToPantheonUser($publicKey);
-        $this->addPrivateKeyToCircleProject($circle_url, $circle_token, $privateKey);
-
-        // Follow the project (start a build)
-        $this->circleFollow($circle_url, $circle_token);
-    }
-
-    /**
      * Provide some simple aliases to reduce typing when selecting common repositories
      */
     protected function expandSourceAliases($source)
@@ -300,17 +330,21 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
         $aliases = [
             'example-drops-8-composer' => ['d8', 'drops-8'],
             'example-drops-7-composer' => ['d7', 'drops-7'],
-
-            // The wordpress template has not been created yet
-            // 'example-wordpress-composer' => ['wp', 'wordpress'],
+            'example-wordpress-composer' => ['wp', 'wordpress'],
         ];
 
+        // Convert the defaults into a more straightforward mapping:
+        //   shortcut: project
         $map = [strtolower($source) => $source];
         foreach ($aliases as $full => $shortcuts) {
             foreach ($shortcuts as $alias) {
                 $map[$alias] = $full;
             }
         }
+
+        // Add in the user shortcuts.
+        $user_shortcuts = $this->getConfig()->get('command.build.project.create.shortcuts', []);
+        $map = array_merge($map, $user_shortcuts);
 
         return $map[strtolower($source)];
     }
@@ -322,49 +356,66 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
      */
     protected function autodetectUpstream($siteDir)
     {
-        return 'Empty Upstream';
-        // or 'Drupal 7' or 'WordPress'
-        // return 'Drupal 8';
-    }
-
-    /**
-     * Create a unique ssh key pair to use in testing
-     *
-     * @param string $ssh_key_email
-     * @param string $prefix
-     * @return [string, string]
-     */
-    protected function createSshKeyPair($ssh_key_email, $prefix = 'id')
-    {
-        $tmpkeydir = $this->tempdir('ssh-keys');
-
-        $privateKey = "$tmpkeydir/$prefix";
-        $publicKey = "$privateKey.pub";
-
-        $this->passthru("ssh-keygen -t rsa -b 4096 -f $privateKey -N '' -C '$ssh_key_email'");
-
-        return [$publicKey, $privateKey];
-    }
-
-    /**
-     * Use the GitHub API to create a new GitHub project.
-     */
-    protected function createGitHub($source, $target, $github_org, $github_token, $stability = '')
-    {
-        // We need a different URL here if $github_org is an org; if no
-        // org is provided, then we use a simpler URL to create a repository
-        // owned by the currently-authenitcated user.
-        $createRepoUrl = "orgs/$github_org/repos";
-        $target_org = $github_org;
-        if (empty($github_org)) {
-            $createRepoUrl = 'user/repos';
-            $userData = $this->curlGitHub('user', [], $github_token);
-            $target_org = $userData['login'];
+        $upstream = $this->autodetectUpstreamAtDir("$siteDir/web");
+        if ($upstream) {
+            return $upstream;
         }
-        $target_project = "$target_org/$target";
+        $upstream = $this->autodetectUpstreamAtDir($siteDir);
+        if ($upstream) {
+            return $upstream;
+        }
+        // Can't tell? Assume Drupal 8.
+        return 'Empty Upstream';
+    }
 
+    protected function autodetectUpstreamAtDir($siteDir)
+    {
+        $upstream_map = [
+          'core/misc/drupal.js' => 'empty', // Drupal 8
+          'misc/drupal.js' => 'empty-7', // Drupal 7
+          'wp-config.php' => 'empty-wordpress', // WordPress
+        ];
+
+        foreach ($upstream_map as $file => $upstream) {
+            if (file_exists("$siteDir/$file")) {
+                return $upstream;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Use composer create-project to create a new local copy of the source project.
+     */
+    protected function createFromSource($source, $target, $stability = '', $options = [])
+    {
+        if (is_dir($source)) {
+            return $this->useExistingSourceDirectory($source, $options['preserve-local-repository']);
+        }
+        else {
+            return $this->createFromSourceProject($source, $target, $stability);
+        }
+    }
+
+    protected function useExistingSourceDirectory($source, $preserve_local_repository)
+    {
+        if ($preserve_local_repository) {
+            if (!is_dir("$source/.git")) {
+                throw new TerminusException('Specified --preserve-local-repository, but the directory {source} does not contains a .git directory.', compact('$source'));
+            }
+        }
+        else {
+            if (is_dir("$source/.git")) {
+                throw new TerminusException('The directory {source} already contains a .git directory. Use --preserve-local-repository if you wish to use this existing repository.', compact('$source'));
+            }
+        }
+        return $source;
+    }
+
+    protected function createFromSourceProject($source, $target, $stability = '')
+    {
         $source_project = $this->sourceProjectFromSource($source);
-        $tmpsitedir = $this->tempdir('local-site');
 
         $this->log()->notice('Creating project and resolving dependencies.');
 
@@ -376,22 +427,12 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
         // Pass in --stability to `composer create-project` if user requested it.
         $stability_flag = empty($stability) ? '' : "--stability $stability";
 
+        // Create a working directory
+        $tmpsitedir = $this->tempdir('local-site');
+
         $this->passthru("composer create-project --working-dir=$tmpsitedir $source $target -n $stability_flag");
-
-        // Create a GitHub repository
-        $this->log()->notice('Creating repository {repo} from {source}', ['repo' => $target_project, 'source' => $source]);
-        $postData = ['name' => $target];
-        $result = $this->curlGitHub($createRepoUrl, $postData, $github_token);
-
-        // Create a git repository. Add an origin just to have the data there
-        // when collecting the build metadata later. We use the 'pantheon'
-        // remote when pushing.
-        // TODO: Do we need to remove $local_site_path/.git? (-n in create-project should obviate this need)
         $local_site_path = "$tmpsitedir/$target";
-        $this->passthru("git -C $local_site_path init");
-        $this->passthru("git -C $local_site_path remote add origin 'git@github.com:{$target_project}.git'");
-
-        return [$target_project, $local_site_path];
+        return $local_site_path;
     }
 
     /**
@@ -403,18 +444,6 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
     protected function sourceProjectFromSource($source)
     {
         return preg_replace('/:.*/', '', $source);
-    }
-
-    /**
-     * Make the initial commit to our new GitHub project.
-     */
-    protected function initialCommit($repositoryDir)
-    {
-        // Add the canonical repository files to the new GitHub project
-        // respecting .gitignore.
-        $this->passthru("git -C $repositoryDir add .");
-        $this->passthru("git -C $repositoryDir commit -m 'Initial commit'");
-        return $this->getHeadCommit($repositoryDir);
     }
 
     /**
@@ -431,15 +460,6 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
     protected function resetToCommit($repositoryDir, $resetToCommit = 'HEAD^')
     {
         $this->passthru("git -C $repositoryDir reset --hard $resetToCommit");
-    }
-
-    /**
-     * Make the initial commit to our new GitHub project.
-     */
-    protected function pushToGitHub($github_token, $target_project, $repositoryDir)
-    {
-        $remote_url = "https://$github_token:x-oauth-basic@github.com/${target_project}.git";
-        $this->passthruRedacted("git -C $repositoryDir push --progress $remote_url master", $github_token);
     }
 
     // TODO: if we could look up the commandfile for
@@ -580,7 +600,7 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
         $this->runCommandTemplateOnRemoteEnv($site_env_id, $command_template, "Export configuration", $options);
 
         // Commit the changes. Quicksilver is not set up to push these back
-        // to GitHub from the dev branch, but we don't want to leave these changes
+        // to the Git provider from the dev branch, but we don't want to leave these changes
         // uncommitted.
         $env->commitChanges('Install site and export configuration.');
 
@@ -590,7 +610,10 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
         $this->rsync($site_env_id, ':code/config', $repositoryDir);
 
         $this->passthru("git -C $repositoryDir add config");
-        $this->passthru("git -C $repositoryDir commit -m 'Export configuration'");
+        exec("git -C $repositoryDir status --porcelain", $outputLines, $status);
+        if (!empty($outputLines)) {
+            $this->passthru("git -C $repositoryDir commit -m 'Export configuration'");
+        }
     }
 
     /**
@@ -680,7 +703,9 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
         }
 
         // Sanity check: only push from directories that have .git and composer.json
-        foreach (['.git', 'composer.json'] as $item) {
+        // Note: we might want to use push-to-pantheon even if there isn't a composer.json,
+        // e.g. when using build:env:create with drops-7.
+        foreach (['.git'] as $item) {
             if (!file_exists("$repositoryDir/$item")) {
                 throw new TerminusException('Cannot push from {dir}: missing {item}.', ['dir' => $repositoryDir, 'item' => $item]);
             }
@@ -703,6 +728,15 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
         // Record the metadata for this build
         $metadata = $this->getBuildMetadata($repositoryDir);
         $this->recordBuildMetadata($metadata, $repositoryDir);
+
+        // Drupal 7: Drush requires a settings.php file. Add one to the
+        // build results if one does not already exist.
+        $default_dir = "$repositoryDir/" . (is_dir("$repositoryDir/web") ? 'web/sites/default' : 'sites/default');
+        $settings_file = "$default_dir/settings.php";
+        if (is_dir($default_dir) && !is_file($settings_file)) {
+          file_put_contents($settings_file, "<?php\n");
+          $this->log()->notice('Created empty settings.php file {settingsphp}.', ['settingsphp' => $settings_file]);
+        }
 
         // Remove any .git directories added by composer from the set of files
         // being committed. Ideally, there will be none. We cannot allow any to
@@ -760,157 +794,32 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
         return preg_replace('#[^:/]*[:/]([^/:]*/[^.]*)\.git#', '\1', str_replace('https://', '', $url));
     }
 
-
-    protected function preserveEnvsWithOpenPRs($remoteUrl, $oldestEnvironments, $multidev_delete_pattern, $auth = '')
+    protected function preserveEnvsWithOpenPRs($remoteUrl, $oldestEnvironments, $multidev_delete_pattern)
     {
         $project = $this->projectFromRemoteUrl($remoteUrl);
-        $branchList = $this->branchesForOpenPullRequests($project, $auth);
-        return $this->filterBranches($oldestEnvironments, $branchList, $multidev_delete_pattern);
-    }
+        // Get back a pr-number => branch-name list
 
-    function branchesForOpenPullRequests($project, $auth = '')
-    {
-        $data = $this->curlGitHub("repos/$project/pulls?state=open", [], $auth);
+        $closedBranchList = $this->git_provider->branchesForPullRequests($project, 'closed');
 
-        $branchList = array_map(
-            function ($item) {
-                return $item['head']['ref'];
-            },
-            $data
-        );
+        // Find any that match "pr-NNN", for some NNN in pr-number.
+        $result = $this->findBranches($oldestEnvironments, array_keys($closedBranchList), $multidev_delete_pattern);
+        // Add any that match "pr-BRANCH", for some BRANCH in branch-name.
+        $result = array_merge($result, $this->findBranches($oldestEnvironments, array_values($closedBranchList), $multidev_delete_pattern));
 
-        return $branchList;
-    }
-
-    protected function createAuthorizationHeaderCurlChannel($url, $auth = '')
-    {
-        $headers = [
-            'Content-Type: application/json',
-            'User-Agent: pantheon/terminus-build-tools-plugin'
-        ];
-
-        if (!empty($auth)) {
-            $headers[] = "Authorization: token $auth";
+        // If there are no closed pull requests, then there is no need
+        // to look for open pull requests
+        if (empty($result)) {
+            return $result;
         }
 
-        $ch = curl_init();
-        curl_setopt($ch, CURLOPT_URL, $url);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 5);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+        $openBranchList = $this->git_provider->branchesForPullRequests($project, 'open');
 
-        return $ch;
-    }
+        // Remove any that match "pr-NNN" and have an open pull request
+        $result = $this->filterBranches($result, array_keys($openBranchList), $multidev_delete_pattern);
+        // Remove any that match "pr-BRANCH", and have an open pull request
+        $result = $this->filterBranches($result, array_values($openBranchList), $multidev_delete_pattern);
 
-    protected function createBasicAuthenticationCurlChannel($url, $username, $password = '')
-    {
-        $ch = $this->createAuthorizationHeaderCurlChannel($url);
-        curl_setopt($ch, CURLOPT_USERPWD, $username . ":" . $password);
-        return $ch;
-    }
-
-    protected function setCurlChannelPostData($ch, $postData, $force = false)
-    {
-        if (!empty($postData) || $force) {
-            $payload = json_encode($postData);
-            curl_setopt($ch, CURLOPT_POST, 1);
-            curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
-        }
-    }
-
-    public function execCurlRequest($ch, $service = 'API request')
-    {
-        $result = curl_exec($ch);
-        if(curl_errno($ch))
-        {
-            throw new TerminusException(curl_error($ch));
-        }
-        $data = json_decode($result, true);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-
-        $errors = [];
-        if (isset($data['errors'])) {
-            foreach ($data['errors'] as $error) {
-                $errors[] = $error['message'];
-            }
-        }
-        if ($httpCode && ($httpCode >= 300)) {
-            $errors[] = "Http status code: $httpCode";
-        }
-
-        $message = isset($data['message']) ? "{$data['message']}." : '';
-
-        if (!empty($message) || !empty($errors)) {
-            throw new TerminusException('{service} error: {message} {errors}', ['service' => $service, 'message' => $message, 'errors' => implode("\n", $errors)]);
-        }
-
-        return $data;
-    }
-
-    protected function setCircleEnvironmentVars($circle_url, $token, $env)
-    {
-        foreach ($env as $key => $value) {
-            $data = ['name' => $key, 'value' => $value];
-            $this->curlCircleCI($data, "$circle_url/envvar", $token);
-        }
-    }
-
-    protected function circleFollow($circle_url, $token)
-    {
-        $this->curlCircleCI([], "$circle_url/follow", $token);
-    }
-
-    protected function addPublicKeyToPantheonUser($publicKey)
-    {
-        $this->session()->getUser()->getSSHKeys()->addKey($publicKey);
-    }
-
-    protected function addPrivateKeyToCircleProject($circle_url, $token, $privateKey)
-    {
-        $privateKeyContents = file_get_contents($privateKey);
-        $data = [
-            'hostname' => 'drush.in',
-            'private_key' => $privateKeyContents,
-        ];
-        $this->curlCircleCI($data, "$circle_url/ssh-key", $token);
-    }
-
-    protected function curlCircleCI($data, $url, $auth)
-    {
-        $this->log()->notice('Call CircleCI API: {uri}', ['uri' => $url]);
-        $ch = $this->createBasicAuthenticationCurlChannel($url, $auth);
-        $this->setCurlChannelPostData($ch, $data, true);
-        return $this->execCurlRequest($ch, 'CircleCI');
-    }
-
-    protected function createGitHubCurlChannel($uri, $auth = '')
-    {
-        $url = "https://api.github.com/$uri";
-        return $this->createAuthorizationHeaderCurlChannel($url, $auth);
-    }
-
-    protected function createGitHubPostChannel($uri, $postData = [], $auth = '')
-    {
-        $ch = $this->createGitHubCurlChannel($uri, $auth);
-        $this->setCurlChannelPostData($ch, $postData);
-
-        return $ch;
-    }
-
-    protected function createGitHubDeleteChannel($uri, $auth = '')
-    {
-        $ch = $this->createGitHubCurlChannel($uri, $auth);
-        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'DELETE');
-
-        return $ch;
-    }
-
-    public function curlGitHub($uri, $postData = [], $auth = '')
-    {
-        $this->log()->notice('Call GitHub API: {uri}', ['uri' => $uri]);
-        $ch = $this->createGitHubPostChannel($uri, $postData, $auth);
-        return $this->execCurlRequest($ch, 'GitHub');
+        return $result;
     }
 
     // TODO: At the moment, this takes multidev environment names,
@@ -930,7 +839,7 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
     // file from the repository root of each multidev environment, which would
     // give us the correct branch name for every environment. We could do
     // this without too much trouble via rsync; this might be a little slow, though.
-    protected function preserveEnvsWithGitHubBranches($oldestEnvironments, $multidev_delete_pattern)
+    protected function preserveEnvsWithBranches($oldestEnvironments, $multidev_delete_pattern)
     {
         $remoteBranch = 'origin';
 
@@ -966,25 +875,45 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
         return array_filter(
             $oldestEnvironments,
             function ($item) use ($branchList, $multidev_delete_pattern) {
-                $match = $item;
-                // If the name is less than the maximum length, then require
-                // an exact match; otherwise, do a 'starts with' test.
-                if (strlen($item) < 11) {
-                    $match .= '$';
-                }
-                // Strip the multidev delete pattern from the beginning of
-                // the match. The multidev env name was composed by prepending
-                // the delete pattern to the branch name, so this recovers
-                // the branch name.
-                $match = preg_replace("%$multidev_delete_pattern%", '', $match);
-                // Constrain match to only match from the beginning
-                $match = "^$match";
-
+                $match = $this->getMatchRegex($item, $multidev_delete_pattern);
                 // Find items in $branchList that match $match.
                 $matches = preg_grep ("%$match%i", $branchList);
                 return empty($matches);
             }
         );
+    }
+
+    protected function findBranches($oldestEnvironments, $branchList, $multidev_delete_pattern)
+    {
+        // Filter environments that have matching remote branches in origin
+        return array_filter(
+            $oldestEnvironments,
+            function ($item) use ($branchList, $multidev_delete_pattern) {
+                $match = $this->getMatchRegex($item, $multidev_delete_pattern);
+                // Find items in $branchList that match $match.
+                $matches = preg_grep ("%$match%i", $branchList);
+                return !empty($matches);
+            }
+        );
+    }
+
+    protected function getMatchRegex($item, $multidev_delete_pattern)
+    {
+        $match = $item;
+        // If the name is less than the maximum length, then require
+        // an exact match; otherwise, do a 'starts with' test.
+        if (strlen($item) < 11) {
+            $match .= '$';
+        }
+        // Strip the multidev delete pattern from the beginning of
+        // the match. The multidev env name was composed by prepending
+        // the delete pattern to the branch name, so this recovers
+        // the branch name.
+        $match = preg_replace("%$multidev_delete_pattern%", '', $match);
+        // Constrain match to only match from the beginning
+        $match = "^$match";
+
+        return $match;
     }
 
     protected function deleteEnv($env, $deleteBranch = false)
@@ -1203,8 +1132,8 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
     {
         // Refresh the remote is already there (e.g. due to CI service caching), just in
         // case. If something changes, this info is NOT removed by "rebuild without cache".
-        if ($this->hasPantheonRemote()) {
-            $this->passthru("git -C $repositoryDir remote remove pantheon");
+        if ($this->hasPantheonRemote($repositoryDir)) {
+            passthru("git -C $repositoryDir remote remove pantheon");
         }
         $connectionInfo = $env->connectionInfo();
         $gitUrl = $connectionInfo['git_url'];
@@ -1214,9 +1143,9 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
     /**
      * Check to see if there is a remote named 'pantheon'
      */
-    protected function hasPantheonRemote()
+    protected function hasPantheonRemote($repositoryDir)
     {
-        exec('git remote show', $output);
+        exec("git -C $repositoryDir remote show", $output);
         return array_search('pantheon', $output) !== false;
     }
 
@@ -1274,9 +1203,12 @@ class BuildToolsBase extends TerminusCommand implements SiteAwareInterface
      */
     protected function commitChangesFile($commit, $file)
     {
-        $outputLines = $this->exec("git show --name-only $commit $file");
+        // If there are any errors, we will presume that the file in
+        // question does not exist in the repository and treat that as
+        // "file did not change" (in other words, ignore errors).
+        exec("git show --name-only $commit -- $file", $outputLines, $result);
 
-        return !empty($outputLines);
+        return ($result == 0) && !empty($outputLines);
     }
 
     /**
