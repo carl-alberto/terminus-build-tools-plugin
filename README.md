@@ -47,6 +47,7 @@ To create a new project consisting of a GitHub project, a Pantheon site, and Cir
 ```
 terminus build:project:create --team="Agency Org Name" d8 example-site
 ```
+Note: If you are getting an error "There are no commands defined in the "build:project" namespace." You may need to install the Terminus plugin first. See the [Installation Section](#installation) of this document.
 
 This single command will:
 
